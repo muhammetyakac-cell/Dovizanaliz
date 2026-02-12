@@ -1,17 +1,22 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
-  TrendingUp, RefreshCw, Calculator, Newspaper, Globe, 
-  BarChart3, ChevronRight, Activity, Cloud, ExternalLink, 
-  Database, AlertCircle 
+  TrendingUp, TrendingDown, RefreshCw, Calculator, 
+  Newspaper, Globe, BarChart3, ChevronRight, Activity, 
+  ArrowUpRight, ArrowDownRight, Maximize2, AlertCircle,
+  ExternalLink, Database, Cloud
 } from 'lucide-react';
 
+// Sabitler
 const REFRESH_MS = 15000; 
-const FETCH_INTERVAL_MS = (24 * 60 * 60 * 1000) / 5;
+const FETCH_INTERVAL_MS = (24 * 60 * 60 * 1000) / 5; // 4.8 saat (Günde 5 kez)
 
-// API Token'ları Vercel Environment Variables'dan gelir
-const BLOB_RW_TOKEN = import.meta.env.VITE_BLOB_READ_WRITE_TOKEN;
-const COLLECT_TOKEN = import.meta.env.VITE_COLLECT_API_TOKEN;
-const BLOB_BASE_URL = "[https://blob.vercel-storage.com](https://blob.vercel-storage.com)";
+// Vercel Blob Storage Bilgileri
+const BLOB_READ_WRITE_TOKEN = "vercel_blob_rw_tCEGNK7xNe8GGTcX_4K7cpSREIQHlDd9pxr7wLgG7nipczw";
+const BLOB_BASE_URL = "https://blob.vercel-storage.com";
+const BLOB_FILENAME = "news_cache.json";
+
+// CollectAPI Bilgileri
+const COLLECT_API_TOKEN = "3jLRcGQbP82sHSXkPIHdiU:6n2WLyVpRJLkDhbgW7DWqQ";
 
 const ASSETS = [
   { code: 'USD', name: 'Amerikan Doları', tvSymbol: 'FX:USDTRY', type: 'currency' },
@@ -39,7 +44,9 @@ const Sparkline = ({ data, color = "#2563eb" }) => {
   );
 };
 
-export default function App() {
+const generateSparklineData = () => Array.from({ length: 12 }, () => ({ value: Math.floor(Math.random() * 100) }));
+
+const App = () => {
   const [rates, setRates] = useState({});
   const [commodities, setCommodities] = useState([]);
   const [news, setNews] = useState([]);
@@ -49,76 +56,136 @@ export default function App() {
   const [calcAmount, setCalcAmount] = useState(1);
   const [selectedAsset, setSelectedAsset] = useState(ASSETS[0]);
   const [errorStatus, setErrorStatus] = useState({ fx: false, commodity: false, news: false });
+  const chartContainerRef = useRef(null);
 
-  const fetchWithRetry = async (url, options, retries = 3) => {
+  // Gelişmiş fetch fonksiyonu
+  const fetchWithRetry = async (url, options, retries = 3, backoff = 1000) => {
     try {
       const response = await fetch(url, options);
-      if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
+      if (!response.ok) throw new Error(`HTTP Hatası: ${response.status}`);
       return await response.json();
     } catch (err) {
-      if (retries > 0) return fetchWithRetry(url, options, retries - 1);
+      if (retries > 0) {
+        await new Promise(resolve => setTimeout(resolve, backoff));
+        return fetchWithRetry(url, options, retries - 1, backoff * 2);
+      }
       throw err;
     }
   };
 
-  const syncNews = async () => {
-    if (!BLOB_RW_TOKEN || !COLLECT_TOKEN) return;
-    const now = Date.now();
+  // Vercel Blob: Listeleme ve Okuma
+  const blobGetLatest = async () => {
     try {
-      // Önbelleği oku
-      const listUrl = `${BLOB_BASE_URL}?prefix=news_cache.json`;
+      const listUrl = `${BLOB_BASE_URL}?prefix=${BLOB_FILENAME}`;
       const proxyListUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(listUrl)}`;
-      const listRes = await fetch(proxyListUrl, { headers: { 'Authorization': `Bearer ${BLOB_RW_TOKEN}`, 'x-api-version': '7' } });
+      
+      const listRes = await fetch(proxyListUrl, {
+        headers: { 
+          'Authorization': `Bearer ${BLOB_READ_WRITE_TOKEN}`,
+          'x-api-version': '7'
+        }
+      });
+      
+      if (!listRes.ok) return null;
       const listData = await listRes.json();
       
-      if (listData?.blobs?.length > 0) {
-        const cached = await (await fetch(listData.blobs[0].url)).json();
-        setNews(cached.articles || []);
-        setLastNewsFetch(cached.lastFetched || null);
-        if (cached.lastFetched && (now - cached.lastFetched < FETCH_INTERVAL_MS)) return;
+      if (listData?.blobs && listData.blobs.length > 0) {
+        const contentRes = await fetch(listData.blobs[0].url);
+        if (contentRes.ok) {
+          return await contentRes.json();
+        }
       }
+      return null;
+    } catch (e) {
+      console.warn("Blob Okuma Hatası:", e);
+      return null;
+    }
+  };
 
-      // API'den çek
-      const apiUrl = "[https://api.collectapi.com/news/getNews?country=tr&tag=general](https://api.collectapi.com/news/getNews?country=tr&tag=general)";
-      const proxyApiUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(apiUrl)}`;
-      const data = await fetchWithRetry(proxyApiUrl, { headers: { "authorization": `apikey ${COLLECT_TOKEN}` } });
+  // Vercel Blob: Veri Yazma
+  const blobPut = async (data) => {
+    try {
+      await fetch(`${BLOB_BASE_URL}/${BLOB_FILENAME}`, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${BLOB_READ_WRITE_TOKEN}`,
+          'x-api-version': '7',
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify(data)
+      });
+    } catch (e) {
+      console.error("Blob Yazma Hatası:", e);
+    }
+  };
+
+  // Haberleri Blob Üzerinden Senkronize Etme
+  const syncNews = async () => {
+    const now = Date.now();
+    let cached = null;
+    
+    try {
+      cached = await blobGetLatest();
+    } catch (e) {
+      console.warn("Önbellek bulunamadı.");
+    }
+    
+    if (cached) {
+      setNews(cached.articles || []);
+      setLastNewsFetch(cached.lastFetched || null);
+      if (cached.lastFetched && (now - cached.lastFetched < FETCH_INTERVAL_MS)) {
+        return;
+      }
+    }
+
+    const apiUrl = "https://api.collectapi.com/news/getNews?country=tr&tag=general";
+    const headers = { 
+      "content-type": "application/json", 
+      "authorization": `apikey ${COLLECT_API_TOKEN}` 
+    };
+
+    try {
+      const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(apiUrl)}`;
+      const data = await fetchWithRetry(proxyUrl, { method: "GET", headers }, 2);
 
       if (data?.success && data?.result) {
         const payload = { articles: data.result.slice(0, 15), lastFetched: now };
-        await fetch(`${BLOB_BASE_URL}/news_cache.json`, {
-          method: 'PUT',
-          headers: { 'Authorization': `Bearer ${BLOB_RW_TOKEN}`, 'x-api-version': '7', 'content-type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
+        blobPut(payload).catch(e => console.error("Blob Sync Hatası:", e));
         setNews(payload.articles);
         setLastNewsFetch(now);
+        setErrorStatus(prev => ({ ...prev, news: false }));
       }
     } catch (e) {
-      console.error("Haber senkronizasyon hatası:", e);
+      console.warn("Haber API Hatası:", e.message);
       setErrorStatus(prev => ({ ...prev, news: true }));
     }
   };
 
   const fetchData = async () => {
     setLoading(true);
+    // Döviz
     try {
-      const fxData = await fetchWithRetry(`https://api.frankfurter.app/latest?base=TRY&symbols=USD,EUR,GBP,CHF`);
-      const formattedRates = {};
-      Object.keys(fxData.rates).forEach(key => {
-        formattedRates[key] = { value: 1 / fxData.rates[key], sparkline: Array.from({ length: 12 }, () => ({ value: Math.random() * 100 })) };
-      });
-      setRates(formattedRates);
+      const fxData = await fetchWithRetry(`https://api.frankfurter.app/latest?base=TRY&symbols=USD,EUR,GBP,CHF`, {});
+      if (fxData?.rates) {
+        const formattedRates = {};
+        Object.keys(fxData.rates).forEach(key => {
+          formattedRates[key] = { value: 1 / fxData.rates[key], sparkline: generateSparklineData() };
+        });
+        setRates(formattedRates);
+        setErrorStatus(prev => ({ ...prev, fx: false }));
+      }
     } catch (e) { setErrorStatus(prev => ({ ...prev, fx: true })); }
 
+    // Emtia
     try {
       const symbols = encodeURIComponent('XAUUSD=X,XAGUSD=X');
-      const commodityData = await fetchWithRetry(`https://api.allorigins.win/raw?url=${encodeURIComponent(`[https://query1.finance.yahoo.com/v7/finance/quote?symbols=$](https://query1.finance.yahoo.com/v7/finance/quote?symbols=$){symbols}`)}`);
+      const commodityData = await fetchWithRetry(`https://api.allorigins.win/raw?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbols}`)}`, {});
       if (commodityData?.quoteResponse?.result) {
         setCommodities(commodityData.quoteResponse.result.map(item => ({
           symbol: item.symbol, price: item.regularMarketPrice || 0, change: item.regularMarketChangePercent || 0,
-          sparkline: Array.from({ length: 12 }, () => ({ value: Math.random() * 100 })), 
-          name: item.symbol === 'XAUUSD=X' ? 'Altın (Ons)' : 'Gümüş (Ons)', code: item.symbol === 'XAUUSD=X' ? 'XAU' : 'XAG'
+          sparkline: generateSparklineData(), name: item.symbol === 'XAUUSD=X' ? 'Altın (Ons)' : 'Gümüş (Ons)', code: item.symbol === 'XAUUSD=X' ? 'XAU' : 'XAG'
         })));
+        setErrorStatus(prev => ({ ...prev, commodity: false }));
       }
     } catch (e) { setErrorStatus(prev => ({ ...prev, commodity: true })); }
 
@@ -129,21 +196,36 @@ export default function App() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, REFRESH_MS);
+    const interval = setInterval(fetchData, REFRESH_MS); 
     return () => clearInterval(interval);
   }, []);
 
+  // TradingView Widget Yükleme Mantığı
   useEffect(() => {
     const containerId = "tv_chart_container";
-    const container = document.getElementById(containerId);
-    if (!container || !window.TradingView) return;
-    container.innerHTML = "";
-    new window.TradingView.MediumWidget({
-      "symbols": [[selectedAsset.name, selectedAsset.tvSymbol]],
-      "chartOnly": false, "width": "100%", "height": 400, "locale": "tr",
-      "colorTheme": "light", "gridLineColor": "rgba(240, 243, 250, 0)",
-      "container_id": containerId
-    });
+    const initWidget = () => {
+      if (window.TradingView && document.getElementById(containerId)) {
+        document.getElementById(containerId).innerHTML = "";
+        new window.TradingView.MediumWidget({
+          "symbols": [[selectedAsset.name, selectedAsset.tvSymbol]],
+          "chartOnly": false, "width": "100%", "height": 400, "locale": "tr",
+          "colorTheme": "light", "gridLineColor": "rgba(240, 243, 250, 0)",
+          "fontFamily": "Inter, sans-serif", "trendLineColor": "#2962FF",
+          "underLineColor": "rgba(41, 98, 255, 0.08)", "underLineBottomColor": "rgba(41, 98, 255, 0)",
+          "isTransparent": false, "autosize": false, "container_id": containerId
+        });
+      }
+    };
+
+    if (!window.TradingView) {
+      const script = document.createElement('script');
+      script.src = "https://s3.tradingview.com/tv.js";
+      script.async = true;
+      script.onload = initWidget;
+      document.head.appendChild(script);
+    } else {
+      initWidget();
+    }
   }, [selectedAsset, lastUpdate]);
 
   const formatMoney = (val, dec = 2) => {
@@ -152,17 +234,17 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#f8fafc] text-slate-900 pb-12">
-      {/* Ticker ve Header buraya gelecek (v4.2 kodundaki gibi) */}
+    <div className="min-h-screen bg-[#f8fafc] text-slate-900 font-sans pb-12">
+      {/* Ticker Bandı */}
       <div className="bg-white border-b border-slate-200 py-1 sticky top-0 z-50 overflow-hidden shadow-sm">
         <div className="flex animate-marquee whitespace-nowrap items-center gap-12 text-xs font-bold text-slate-600 px-4">
-          {Object.entries(rates).map(([code, data]) => (
+          {Object.entries(rates).length > 0 ? Object.entries(rates).map(([code, data]) => (
             <div key={code} className="flex items-center gap-2">
               <span className="text-slate-400">{code}/TRY</span>
               <span className="text-blue-600 font-mono">{formatMoney(data.value, 4)}</span>
               <TrendingUp className="w-3 h-3 text-emerald-500" />
             </div>
-          ))}
+          )) : <div className="text-slate-400">Veriler yükleniyor...</div>}
         </div>
       </div>
 
@@ -175,30 +257,132 @@ export default function App() {
             </div>
             <h1 className="text-4xl font-black text-slate-900 leading-none tracking-tight">Finans <span className="text-blue-600 italic">Analiz</span></h1>
           </div>
+          <div className="flex items-center gap-4 text-sm font-semibold bg-white px-4 py-2 rounded-2xl border border-slate-200 shadow-sm">
+            <span className="flex items-center gap-2 text-slate-500">
+              <div className={`w-2 h-2 rounded-full ${loading ? 'bg-orange-400 animate-pulse' : 'bg-emerald-500'}`} />
+              {lastUpdate ? `Veri: ${lastUpdate.toLocaleTimeString('tr-TR')}` : 'Bağlanıyor...'}
+            </span>
+            <button onClick={fetchData} className="p-1 hover:bg-slate-100 rounded-lg transition-colors focus:outline-none">
+              <RefreshCw className={`w-4 h-4 text-blue-600 ${loading ? 'animate-spin' : ''}`} />
+            </button>
+          </div>
         </header>
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
           <div className="lg:col-span-8 space-y-8">
-            <div className="bg-white rounded-[2rem] shadow-xl border border-slate-200 overflow-hidden h-[400px]">
-              <div id="tv_chart_container" className="h-full w-full" />
+            {/* TradingView Grafik */}
+            <div className="bg-white rounded-[2rem] shadow-xl shadow-slate-200/50 border border-slate-200 overflow-hidden relative min-h-[400px]">
+              <div className="p-6 border-b border-slate-100 flex justify-between items-center text-slate-800">
+                <div className="flex items-center gap-4">
+                  <div className="bg-blue-600 text-white p-3 rounded-2xl shadow-lg shadow-blue-200"><BarChart3 className="w-6 h-6" /></div>
+                  <div><h2 className="text-xl font-bold">{selectedAsset.name}</h2><p className="text-xs text-slate-400 font-bold uppercase tracking-wider">{selectedAsset.tvSymbol}</p></div>
+                </div>
+              </div>
+              <div id="tv_chart_container" className="h-[400px] w-full bg-slate-50" />
+              {loading && !window.TradingView && (
+                <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10">
+                  <div className="flex flex-col items-center gap-2 text-slate-400 font-medium italic">
+                    <Activity className="w-8 h-8 animate-pulse" />
+                    Grafik hazırlanıyor...
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Varlık Listesi */}
+            <div className="bg-white rounded-[2rem] shadow-xl shadow-slate-200/50 border border-slate-200 overflow-hidden">
+              <div className="p-6 border-b border-slate-100 flex items-center justify-between"><h3 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Globe className="w-5 h-5 text-blue-500" /> Piyasa İzleme Listesi</h3></div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead>
+                    <tr className="text-[10px] uppercase text-slate-400 font-black tracking-widest border-b border-slate-50">
+                      <th className="px-8 py-4">Enstrüman</th><th className="px-6 py-4">Fiyat</th><th className="px-6 py-4 text-center">Trend</th><th className="px-6 py-4 text-right">İşlem</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-50">
+                    {ASSETS.map(asset => {
+                      const isSelected = selectedAsset.code === asset.code;
+                      const currentRate = asset.type === 'currency' ? rates[asset.code]?.value : commodities.find(c => c.code === asset.code)?.price;
+                      const sparklineData = asset.type === 'currency' ? rates[asset.code]?.sparkline : commodities.find(c => c.code === asset.code)?.sparkline;
+                      return (
+                        <tr key={asset.code} onClick={() => setSelectedAsset(asset)} className={`group cursor-pointer transition-all ${isSelected ? 'bg-blue-50/50' : 'hover:bg-slate-50'}`}>
+                          <td className="px-8 py-5"><div className="flex items-center gap-3"><div className={`w-10 h-10 rounded-xl flex items-center justify-center font-bold text-xs ${isSelected ? 'bg-blue-600 text-white shadow-md' : 'bg-slate-100 text-slate-500'}`}>{asset.code}</div><div><div className="font-bold text-slate-800">{asset.name}</div><div className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">{asset.type}</div></div></div></td>
+                          <td className="px-6 py-5 font-mono font-bold text-slate-700 text-sm">{currentRate ? (asset.type === 'currency' ? `${formatMoney(currentRate, 4)} ₺` : `$${formatMoney(currentRate)}`) : '---'}</td>
+                          <td className="px-6 py-5 w-32"><div className="h-8 w-full flex items-center"><Sparkline data={sparklineData} color={isSelected ? "#2563eb" : "#94a3b8"} /></div></td>
+                          <td className="px-6 py-5 text-right"><button className={`p-2 rounded-xl transition-all ${isSelected ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-400 group-hover:bg-blue-600 group-hover:text-white'}`}><ChevronRight className="w-4 h-4" /></button></td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
+
           <div className="lg:col-span-4 space-y-8">
-            <div className="bg-white rounded-[2rem] p-8 border border-slate-200 shadow-xl">
-               <h3 className="text-xl font-bold text-slate-800 flex items-center gap-2 mb-6"><Newspaper className="w-6 h-6 text-orange-500" /> Haber Merkezi</h3>
-               <div className="space-y-5">
-                {news.map((item, i) => (
-                  <a key={i} href={item.url} target="_blank" rel="noopener noreferrer" className="group block border-b border-slate-50 pb-4 last:border-0 transition-all hover:translate-x-1">
-                    <span className="text-[9px] font-black text-blue-600 uppercase tracking-widest">{item.source || 'GÜNCEL'}</span>
-                    <p className="text-sm font-bold text-slate-700 group-hover:text-blue-600 mt-1 leading-snug line-clamp-2">{item.name}</p>
+            {/* Dönüştürücü */}
+            <div className="bg-white rounded-[2rem] p-8 border border-slate-200 shadow-xl shadow-slate-200/50">
+              <div className="flex items-center gap-3 mb-6"><div className="p-3 bg-emerald-50 text-emerald-600 rounded-2xl"><Calculator className="w-6 h-6" /></div><h3 className="text-xl font-bold text-slate-800 tracking-tight">Hızlı Dönüştürücü</h3></div>
+              <div className="space-y-4">
+                <div className="space-y-2"><label className="text-[10px] font-black text-slate-400 uppercase tracking-tighter text-slate-400">Bozulacak Miktar (TRY)</label><input type="number" value={calcAmount} onChange={(e) => setCalcAmount(e.target.value)} className="w-full bg-slate-50 border-none rounded-2xl p-4 font-bold text-lg focus:ring-2 focus:ring-blue-500 outline-none transition-all shadow-inner text-slate-800" /></div>
+                <div className="grid grid-cols-2 gap-3 pt-2">
+                  {ASSETS.slice(0, 4).map(asset => {
+                    const rate = asset.type === 'currency' ? rates[asset.code]?.value : (commodities.find(c => c.code === asset.code)?.price * (rates['USD']?.value || 1));
+                    return <div key={asset.code} className="bg-slate-50 p-4 rounded-2xl border border-slate-100 hover:border-blue-100 transition-colors"><div className="text-[10px] font-bold text-slate-400 mb-1">{asset.code} Karşılığı</div><div className="font-black text-slate-700 truncate text-sm">{rate ? formatMoney(calcAmount / rate, 2) : '---'}</div></div>;
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* Haber Merkezi */}
+            <div className="bg-white rounded-[2rem] p-8 border border-slate-200 shadow-xl shadow-slate-200/50 relative overflow-hidden">
+              <div className="flex items-center justify-between mb-6">
+                <h3 className="text-xl font-bold text-slate-800 flex items-center gap-2"><Newspaper className="w-6 h-6 text-orange-500" /> Haber Merkezi</h3>
+                <div className="flex items-center gap-1 bg-blue-50 px-2 py-1 rounded-lg border border-blue-100 shadow-sm">
+                  <Cloud className="w-3 h-3 text-blue-500" />
+                  <span className="text-[9px] font-bold text-blue-600 uppercase tracking-tighter italic">Vercel Blob</span>
+                </div>
+              </div>
+              <div className="space-y-5 min-h-[100px]">
+                {news && news.length > 0 ? news.map((item, i) => (
+                  <a key={i} href={item.url} target="_blank" rel="noopener noreferrer" className="group block border-b border-slate-50 pb-4 last:border-0 last:pb-0 transition-all hover:translate-x-1">
+                    <div className="flex justify-between items-start gap-2 text-slate-900">
+                      <span className="text-[9px] font-black text-blue-600 uppercase tracking-widest">{item.source || 'GÜNCEL'}</span>
+                      <ExternalLink className="w-3 h-3 text-slate-300 opacity-0 group-hover:opacity-100 transition-all" />
+                    </div>
+                    <p className="text-sm font-bold text-slate-700 group-hover:text-blue-600 transition-colors mt-1 leading-snug line-clamp-2">{item.name}</p>
                   </a>
-                ))}
-               </div>
+                )) : (
+                  <div className="py-8 text-center flex flex-col items-center gap-2 text-slate-400">
+                    <Activity className="w-8 h-8 animate-pulse text-slate-200" />
+                    <div className="text-xs italic tracking-tight">Veritabanı senkronize ediliyor...</div>
+                  </div>
+                )}
+              </div>
+              {lastNewsFetch && (
+                <div className="mt-6 pt-4 border-t border-slate-50 text-[10px] text-slate-400 text-center italic font-medium">
+                  Senkronizasyon: {new Date(lastNewsFetch).toLocaleString('tr-TR')}
+                </div>
+              )}
             </div>
           </div>
         </div>
       </div>
-      <script src="[https://s3.tradingview.com/tv.js](https://s3.tradingview.com/tv.js)"></script>
+
+      <footer className="text-center py-10 text-slate-400 text-xs px-4"><p>© 2026 Finans Merkezi - Vercel Blob Storage Caching v4.3</p></footer>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
+        body { font-family: 'Inter', sans-serif; background: #f8fafc; margin: 0; }
+        @keyframes marquee { 0% { transform: translateX(0); } 100% { transform: translateX(-50%); } }
+        .animate-marquee { display: inline-flex; animation: marquee 30s linear infinite; width: max-content; }
+        .animate-marquee:hover { animation-play-state: paused; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+      `}</style>
     </div>
   );
-}
+};
+
+export default App;
