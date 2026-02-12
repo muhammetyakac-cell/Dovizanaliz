@@ -6,6 +6,11 @@ import {
   ExternalLink, Database, Cloud
 } from 'lucide-react';
 
+/**
+ * NOT: "Dynamic require" hatasını gidermek için Vercel Blob SDK'sı (import { put } ...) 
+ * yerine doğrudan Vercel Blob REST API'si kullanılmaktadır.
+ */
+
 // Sabitler
 const REFRESH_MS = 15000; 
 const FETCH_INTERVAL_MS = (24 * 60 * 60 * 1000) / 5; // 4.8 saat (Günde 5 kez)
@@ -26,6 +31,7 @@ const ASSETS = [
   { code: 'XAG', name: 'Gümüş (Ons)', tvSymbol: 'OANDA:XAGUSD', type: 'commodity' },
 ];
 
+// Trendler için basit SVG çizim bileşeni
 const Sparkline = ({ data, color = "#2563eb" }) => {
   if (!data || data.length === 0) return null;
   const width = 100; const height = 30;
@@ -56,9 +62,8 @@ const App = () => {
   const [calcAmount, setCalcAmount] = useState(1);
   const [selectedAsset, setSelectedAsset] = useState(ASSETS[0]);
   const [errorStatus, setErrorStatus] = useState({ fx: false, commodity: false, news: false });
-  const chartContainerRef = useRef(null);
 
-  // Gelişmiş fetch fonksiyonu
+  // Gelişmiş fetch fonksiyonu (Retry mekanizmalı)
   const fetchWithRetry = async (url, options, retries = 3, backoff = 1000) => {
     try {
       const response = await fetch(url, options);
@@ -73,10 +78,14 @@ const App = () => {
     }
   };
 
-  // Vercel Blob: Listeleme ve Okuma
+  /**
+   * Vercel Blob: Listeleme ve Okuma (REST API üzerinden)
+   * SDK hatasını gidermek için doğrudan fetch kullanılır.
+   */
   const blobGetLatest = async () => {
     try {
       const listUrl = `${BLOB_BASE_URL}?prefix=${BLOB_FILENAME}`;
+      // CORS sorunlarını aşmak için proxy üzerinden listeleme isteği
       const proxyListUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(listUrl)}`;
       
       const listRes = await fetch(proxyListUrl, {
@@ -90,10 +99,9 @@ const App = () => {
       const listData = await listRes.json();
       
       if (listData?.blobs && listData.blobs.length > 0) {
-        const contentRes = await fetch(listData.blobs[0].url);
-        if (contentRes.ok) {
-          return await contentRes.json();
-        }
+        // En güncel blob'un içeriğini URL üzerinden çek
+        const response = await fetch(listData.blobs[0].url);
+        if (response.ok) return await response.json();
       }
       return null;
     } catch (e) {
@@ -102,10 +110,13 @@ const App = () => {
     }
   };
 
-  // Vercel Blob: Veri Yazma
+  /**
+   * Vercel Blob: Veri Yazma (REST API üzerinden)
+   */
   const blobPut = async (data) => {
     try {
-      await fetch(`${BLOB_BASE_URL}/${BLOB_FILENAME}`, {
+      const putUrl = `${BLOB_BASE_URL}/${BLOB_FILENAME}`;
+      await fetch(putUrl, {
         method: 'PUT',
         headers: {
           'Authorization': `Bearer ${BLOB_READ_WRITE_TOKEN}`,
@@ -115,7 +126,7 @@ const App = () => {
         body: JSON.stringify(data)
       });
     } catch (e) {
-      console.error("Blob Yazma Hatası:", e);
+      console.error("Blob Put Hatası:", e);
     }
   };
 
@@ -127,12 +138,13 @@ const App = () => {
     try {
       cached = await blobGetLatest();
     } catch (e) {
-      console.warn("Önbellek bulunamadı.");
+      console.warn("Önbellek çekilemedi.");
     }
     
     if (cached) {
       setNews(cached.articles || []);
       setLastNewsFetch(cached.lastFetched || null);
+      // Zaman kontrolü: 4.8 saat geçmediyse API'ye gitme
       if (cached.lastFetched && (now - cached.lastFetched < FETCH_INTERVAL_MS)) {
         return;
       }
@@ -150,13 +162,16 @@ const App = () => {
 
       if (data?.success && data?.result) {
         const payload = { articles: data.result.slice(0, 15), lastFetched: now };
-        blobPut(payload).catch(e => console.error("Blob Sync Hatası:", e));
+        
+        // Blob'a yaz (REST API ile)
+        await blobPut(payload);
+        
         setNews(payload.articles);
         setLastNewsFetch(now);
         setErrorStatus(prev => ({ ...prev, news: false }));
       }
     } catch (e) {
-      console.warn("Haber API Hatası:", e.message);
+      console.warn("CollectAPI Hatası:", e.message);
       setErrorStatus(prev => ({ ...prev, news: true }));
     }
   };
@@ -200,7 +215,6 @@ const App = () => {
     return () => clearInterval(interval);
   }, []);
 
-  // TradingView Widget Yükleme Mantığı
   useEffect(() => {
     const containerId = "tv_chart_container";
     const initWidget = () => {
@@ -235,7 +249,7 @@ const App = () => {
 
   return (
     <div className="min-h-screen bg-[#f8fafc] text-slate-900 font-sans pb-12">
-      {/* Ticker Bandı */}
+      {/* Üst Kayan Fiyat Bandı */}
       <div className="bg-white border-b border-slate-200 py-1 sticky top-0 z-50 overflow-hidden shadow-sm">
         <div className="flex animate-marquee whitespace-nowrap items-center gap-12 text-xs font-bold text-slate-600 px-4">
           {Object.entries(rates).length > 0 ? Object.entries(rates).map(([code, data]) => (
@@ -244,11 +258,12 @@ const App = () => {
               <span className="text-blue-600 font-mono">{formatMoney(data.value, 4)}</span>
               <TrendingUp className="w-3 h-3 text-emerald-500" />
             </div>
-          )) : <div className="text-slate-400">Veriler yükleniyor...</div>}
+          )) : <div className="text-slate-400 italic">Döviz kurları yükleniyor...</div>}
         </div>
       </div>
 
       <div className="max-w-7xl mx-auto p-4 md:p-8 space-y-8">
+        {/* Header Alanı */}
         <header className="flex flex-col md:flex-row md:items-end justify-between gap-4">
           <div>
             <div className="flex items-center gap-2 text-blue-600 font-bold mb-1">
@@ -270,7 +285,7 @@ const App = () => {
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
           <div className="lg:col-span-8 space-y-8">
-            {/* TradingView Grafik */}
+            {/* TradingView Grafik Kartı */}
             <div className="bg-white rounded-[2rem] shadow-xl shadow-slate-200/50 border border-slate-200 overflow-hidden relative min-h-[400px]">
               <div className="p-6 border-b border-slate-100 flex justify-between items-center text-slate-800">
                 <div className="flex items-center gap-4">
@@ -279,17 +294,9 @@ const App = () => {
                 </div>
               </div>
               <div id="tv_chart_container" className="h-[400px] w-full bg-slate-50" />
-              {loading && !window.TradingView && (
-                <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10">
-                  <div className="flex flex-col items-center gap-2 text-slate-400 font-medium italic">
-                    <Activity className="w-8 h-8 animate-pulse" />
-                    Grafik hazırlanıyor...
-                  </div>
-                </div>
-              )}
             </div>
 
-            {/* Varlık Listesi */}
+            {/* Piyasa İzleme Listesi */}
             <div className="bg-white rounded-[2rem] shadow-xl shadow-slate-200/50 border border-slate-200 overflow-hidden">
               <div className="p-6 border-b border-slate-100 flex items-center justify-between"><h3 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Globe className="w-5 h-5 text-blue-500" /> Piyasa İzleme Listesi</h3></div>
               <div className="overflow-x-auto">
@@ -320,7 +327,7 @@ const App = () => {
           </div>
 
           <div className="lg:col-span-4 space-y-8">
-            {/* Dönüştürücü */}
+            {/* Hesap Makinesi Widget */}
             <div className="bg-white rounded-[2rem] p-8 border border-slate-200 shadow-xl shadow-slate-200/50">
               <div className="flex items-center gap-3 mb-6"><div className="p-3 bg-emerald-50 text-emerald-600 rounded-2xl"><Calculator className="w-6 h-6" /></div><h3 className="text-xl font-bold text-slate-800 tracking-tight">Hızlı Dönüştürücü</h3></div>
               <div className="space-y-4">
@@ -334,13 +341,13 @@ const App = () => {
               </div>
             </div>
 
-            {/* Haber Merkezi */}
+            {/* Haber Merkezi Widget (Blob Önbellekli) */}
             <div className="bg-white rounded-[2rem] p-8 border border-slate-200 shadow-xl shadow-slate-200/50 relative overflow-hidden">
               <div className="flex items-center justify-between mb-6">
                 <h3 className="text-xl font-bold text-slate-800 flex items-center gap-2"><Newspaper className="w-6 h-6 text-orange-500" /> Haber Merkezi</h3>
                 <div className="flex items-center gap-1 bg-blue-50 px-2 py-1 rounded-lg border border-blue-100 shadow-sm">
                   <Cloud className="w-3 h-3 text-blue-500" />
-                  <span className="text-[9px] font-bold text-blue-600 uppercase tracking-tighter italic">Vercel Blob</span>
+                  <span className="text-[9px] font-bold text-blue-600 uppercase tracking-tighter italic font-black">REST API</span>
                 </div>
               </div>
               <div className="space-y-5 min-h-[100px]">
@@ -369,7 +376,7 @@ const App = () => {
         </div>
       </div>
 
-      <footer className="text-center py-10 text-slate-400 text-xs px-4"><p>© 2026 Finans Merkezi - Vercel Blob Storage Caching v4.3</p></footer>
+      <footer className="text-center py-10 text-slate-400 text-xs px-4"><p>© 2026 Finans Merkezi - Vercel Blob REST Architecture v4.5</p></footer>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
         body { font-family: 'Inter', sans-serif; background: #f8fafc; margin: 0; }
