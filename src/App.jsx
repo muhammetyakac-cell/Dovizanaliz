@@ -6,22 +6,8 @@ import {
   ExternalLink, Database, Cloud
 } from 'lucide-react';
 
-/**
- * NOT: "Dynamic require" hatasını gidermek için Vercel Blob SDK'sı (import { put } ...) 
- * yerine doğrudan Vercel Blob REST API'si kullanılmaktadır.
- */
-
 // Sabitler
-const REFRESH_MS = 15000; 
-const FETCH_INTERVAL_MS = (24 * 60 * 60 * 1000) / 5; // 4.8 saat (Günde 5 kez)
-
-// Vercel Blob Storage Bilgileri
-const BLOB_READ_WRITE_TOKEN = "BLOB_READ_WRITE_TOKEN";
-const BLOB_BASE_URL = "https://blob.vercel-storage.com";
-const BLOB_FILENAME = "news_cache.json";
-
-// CollectAPI Bilgileri
-const COLLECT_API_TOKEN = "COLLECT_API_TOKEN";
+const REFRESH_MS = 15000;
 
 const ASSETS = [
   { code: 'USD', name: 'Amerikan Doları', tvSymbol: 'FX:USDTRY', type: 'currency' },
@@ -78,100 +64,18 @@ const App = () => {
     }
   };
 
-  /**
-   * Vercel Blob: Listeleme ve Okuma (REST API üzerinden)
-   * SDK hatasını gidermek için doğrudan fetch kullanılır.
-   */
-  const blobGetLatest = async () => {
-    try {
-      const listUrl = `${BLOB_BASE_URL}?prefix=${BLOB_FILENAME}`;
-      // CORS sorunlarını aşmak için proxy üzerinden listeleme isteği
-      const proxyListUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(listUrl)}`;
-      
-      const listRes = await fetch(proxyListUrl, {
-        headers: { 
-          'Authorization': `Bearer ${BLOB_READ_WRITE_TOKEN}`,
-          'x-api-version': '7'
-        }
-      });
-      
-      if (!listRes.ok) return null;
-      const listData = await listRes.json();
-      
-      if (listData?.blobs && listData.blobs.length > 0) {
-        // En güncel blob'un içeriğini URL üzerinden çek
-        const response = await fetch(listData.blobs[0].url);
-        if (response.ok) return await response.json();
-      }
-      return null;
-    } catch (e) {
-      console.warn("Blob Okuma Hatası:", e);
-      return null;
-    }
-  };
 
-  /**
-   * Vercel Blob: Veri Yazma (REST API üzerinden)
-   */
-  const blobPut = async (data) => {
-    try {
-      const putUrl = `${BLOB_BASE_URL}/${BLOB_FILENAME}`;
-      await fetch(putUrl, {
-        method: 'PUT',
-        headers: {
-          'Authorization': `Bearer ${BLOB_READ_WRITE_TOKEN}`,
-          'x-api-version': '7',
-          'content-type': 'application/json'
-        },
-        body: JSON.stringify(data)
-      });
-    } catch (e) {
-      console.error("Blob Put Hatası:", e);
-    }
-  };
-
-  // Haberleri Blob Üzerinden Senkronize Etme
   const syncNews = async () => {
-    const now = Date.now();
-    let cached = null;
-    
     try {
-      cached = await blobGetLatest();
-    } catch (e) {
-      console.warn("Önbellek çekilemedi.");
-    }
-    
-    if (cached) {
-      setNews(cached.articles || []);
-      setLastNewsFetch(cached.lastFetched || null);
-      // Zaman kontrolü: 4.8 saat geçmediyse API'ye gitme
-      if (cached.lastFetched && (now - cached.lastFetched < FETCH_INTERVAL_MS)) {
-        return;
-      }
-    }
+      const data = await fetchWithRetry('/api/news', { method: 'GET' }, 2);
 
-    const apiUrl = "https://api.collectapi.com/news/getNews?country=tr&tag=general";
-    const headers = { 
-      "content-type": "application/json", 
-      "authorization": `apikey ${COLLECT_API_TOKEN}` 
-    };
-
-    try {
-      const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(apiUrl)}`;
-      const data = await fetchWithRetry(proxyUrl, { method: "GET", headers }, 2);
-
-      if (data?.success && data?.result) {
-        const payload = { articles: data.result.slice(0, 15), lastFetched: now };
-        
-        // Blob'a yaz (REST API ile)
-        await blobPut(payload);
-        
-        setNews(payload.articles);
-        setLastNewsFetch(now);
+      if (data?.articles) {
+        setNews(data.articles);
+        setLastNewsFetch(data.lastFetched || null);
         setErrorStatus(prev => ({ ...prev, news: false }));
       }
     } catch (e) {
-      console.warn("CollectAPI Hatası:", e.message);
+      console.warn('Haber servisi hatası:', e.message);
       setErrorStatus(prev => ({ ...prev, news: true }));
     }
   };
