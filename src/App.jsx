@@ -16,12 +16,12 @@ const REFRESH_MS = 15000;
 const FETCH_INTERVAL_MS = (24 * 60 * 60 * 1000) / 5; // 4.8 saat (Günde 5 kez)
 
 // Vercel Blob Storage Bilgileri
-const BLOB_READ_WRITE_TOKEN = "vercel_blob_rw_tCEGNK7xNe8GGTcX_4K7cpSREIQHlDd9pxr7wLgG7nipczw";
+const BLOB_READ_WRITE_TOKEN = "BLOB_READ_WRITE_TOKEN";
 const BLOB_BASE_URL = "https://blob.vercel-storage.com";
 const BLOB_FILENAME = "news_cache.json";
 
 // CollectAPI Bilgileri
-const COLLECT_API_TOKEN = "3jLRcGQbP82sHSXkPIHdiU:6n2WLyVpRJLkDhbgW7DWqQ";
+const COLLECT_API_TOKEN = "COLLECT_API_TOKEN";
 
 const ASSETS = [
   { code: 'USD', name: 'Amerikan Doları', tvSymbol: 'FX:USDTRY', type: 'currency' },
